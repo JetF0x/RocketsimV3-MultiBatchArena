@@ -7,7 +7,7 @@ use pyo3::{
     types::PyDict,
 };
 use rocketsim_batch::{
-    BatchArena as RsBatchArena, BatchConfig, layout,
+    BatchArena as RsBatchArena, BatchConfig, Scheduling, layout,
     rocketsim::{ArenaConfig, ArenaMemWeightMode, CarBodyConfig, GameMode, Vec3A},
 };
 
@@ -134,6 +134,9 @@ impl BatchArena {
         tick_skip = 8,
         auto_reset = false,
         max_episode_ticks = None,
+        scheduling = "static",
+        pin_threads = false,
+        pin_cpus = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -149,7 +152,19 @@ impl BatchArena {
         tick_skip: u32,
         auto_reset: bool,
         max_episode_ticks: Option<u64>,
+        scheduling: &str,
+        pin_threads: bool,
+        pin_cpus: Option<Vec<usize>>,
     ) -> PyResult<Self> {
+        let scheduling = match scheduling.to_ascii_lowercase().as_str() {
+            "static" => Scheduling::Static,
+            "stealing" | "work_stealing" => Scheduling::WorkStealing,
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown scheduling {scheduling:?}; expected static or stealing"
+                )));
+            }
+        };
         let game_mode = parse_game_mode(game_mode)?;
         if num_arenas == 0 {
             return Err(PyValueError::new_err("num_arenas must be > 0"));
@@ -173,7 +188,13 @@ impl BatchArena {
             .with_seed(seed)
             .with_tick_skip(tick_skip)
             .with_auto_reset(auto_reset)
-            .with_max_episode_ticks(max_episode_ticks);
+            .with_max_episode_ticks(max_episode_ticks)
+            .with_scheduling(scheduling)
+            .with_pin_threads(pin_threads);
+        let config = match pin_cpus {
+            Some(cpus) => config.with_pin_cpus(cpus),
+            None => config,
+        };
         let inner = py.detach(|| RsBatchArena::new(config));
         Ok(Self { inner })
     }

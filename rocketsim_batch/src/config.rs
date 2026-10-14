@@ -1,5 +1,19 @@
 use rocketsim::{ArenaConfig, ArenaMemWeightMode, CarBodyConfig, GameMode};
 
+/// How a [`crate::BatchArena`] spreads its arenas over the thread pool.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Scheduling {
+    /// Thread `k` of `T` always steps the same contiguous block of arenas
+    /// (`k*N/T .. (k+1)*N/T`), so each arena's state stays in one core's
+    /// caches. Best for large batches (at least ~8 arenas per thread).
+    #[default]
+    Static,
+    /// Rayon work stealing: idle threads take arenas from busy ones. Arenas
+    /// move between cores from step to step, which costs cache misses, but
+    /// uneven or tiny batches balance better.
+    WorkStealing,
+}
+
 /// Settings for a [`crate::BatchArena`].
 ///
 /// Every arena in a batch shares the same config and car layout: `blue_cars`
@@ -31,6 +45,15 @@ pub struct BatchConfig {
     pub auto_reset: bool,
     /// Truncate episodes after this many ticks.
     pub max_episode_ticks: Option<u64>,
+    /// How arenas are assigned to threads.
+    pub scheduling: Scheduling,
+    /// Pin pool thread `i` to one logical CPU: `pin_cpus[i % len]`, or by
+    /// default the first logical CPU of each physical core (see
+    /// [`crate::physical_core_cpus`]). Best on a dedicated machine.
+    pub pin_threads: bool,
+    /// Logical CPUs to pin to when `pin_threads` is set. `None` picks one per
+    /// physical core automatically.
+    pub pin_cpus: Option<Vec<usize>>,
 }
 
 impl BatchConfig {
@@ -49,6 +72,9 @@ impl BatchConfig {
             tick_skip: 8,
             auto_reset: false,
             max_episode_ticks: None,
+            scheduling: Scheduling::Static,
+            pin_threads: false,
+            pin_cpus: None,
         }
     }
 
@@ -98,6 +124,26 @@ impl BatchConfig {
     #[must_use]
     pub const fn with_max_episode_ticks(mut self, max_episode_ticks: Option<u64>) -> Self {
         self.max_episode_ticks = max_episode_ticks;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_scheduling(mut self, scheduling: Scheduling) -> Self {
+        self.scheduling = scheduling;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_pin_threads(mut self, pin_threads: bool) -> Self {
+        self.pin_threads = pin_threads;
+        self
+    }
+
+    /// Pin threads to these logical CPUs (also turns `pin_threads` on).
+    #[must_use]
+    pub fn with_pin_cpus(mut self, pin_cpus: Vec<usize>) -> Self {
+        self.pin_cpus = Some(pin_cpus);
+        self.pin_threads = true;
         self
     }
 

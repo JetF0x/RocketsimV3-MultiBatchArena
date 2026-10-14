@@ -3,16 +3,21 @@
 //!
 //! ```sh
 //! cargo run --release -p rocketsim_batch --example bench_batch -- \
-//!     --arenas 256 --threads 1,2,4 --ticks 8 --steps 500 [--meshes ./collision_meshes]
+//!     --arenas 1024 --threads 16 --ticks 8 --steps 300 --blue 3 --orange 3 --meshes ./collision_meshes
 //! ```
 //!
 //! Without `--meshes` it runs `TheVoid` (no field), which needs no collision
 //! meshes but has no world collisions. Pass `--meshes` to run Soccar.
+//!
+//! `--modes` picks which scheduling modes to compare at each thread count
+//! (default all three): `stealing` (Rayon work stealing), `static` (fixed
+//! arena blocks per thread) and `pinned` (static + threads pinned to one
+//! logical CPU per physical core, or to `--pin-cpus`).
 
 use std::time::Instant;
 
 use rocketsim_batch::{
-    BatchArena, BatchConfig, arena_seed,
+    BatchArena, BatchConfig, Scheduling, arena_seed,
     layout::{self, ACTION_DIM},
     rocketsim::{Arena, GameMode, Team},
     splitmix64,
@@ -26,6 +31,8 @@ struct Args {
     blue: usize,
     orange: usize,
     meshes: Option<String>,
+    modes: Vec<String>,
+    pin_cpus: Option<Vec<usize>>,
 }
 
 fn parse_args() -> Args {
@@ -37,6 +44,8 @@ fn parse_args() -> Args {
         blue: 1,
         orange: 1,
         meshes: None,
+        modes: vec!["stealing".into(), "static".into(), "pinned".into()],
+        pin_cpus: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -51,8 +60,13 @@ fn parse_args() -> Args {
             "--blue" => args.blue = val().parse().unwrap(),
             "--orange" => args.orange = val().parse().unwrap(),
             "--meshes" => args.meshes = Some(val()),
+            "--modes" => args.modes = val().split(',').map(str::to_owned).collect(),
+            "--pin-cpus" => {
+                args.pin_cpus = Some(val().split(',').map(|c| c.parse().unwrap()).collect());
+            }
             _ => panic!(
-                "unknown flag {flag}; use --arenas --threads --ticks --steps --blue --orange --meshes"
+                "unknown flag {flag}; use --arenas --threads --ticks --steps --blue --orange \
+                 --meshes --modes --pin-cpus"
             ),
         }
     }
@@ -119,18 +133,34 @@ fn main() {
     drop(arenas);
 
     for &threads in &args.threads {
-        let mut batch = BatchArena::new(config.clone().with_num_threads(Some(threads)));
-        let start = Instant::now();
-        for s in 0..args.steps {
-            fill_actions(batch.actions_mut(), s);
-            batch.step();
+        for mode in &args.modes {
+            let mut cfg = config.clone().with_num_threads(Some(threads));
+            cfg = match mode.as_str() {
+                "stealing" => cfg.with_scheduling(Scheduling::WorkStealing),
+                "static" => cfg.with_scheduling(Scheduling::Static),
+                "pinned" => match &args.pin_cpus {
+                    Some(cpus) => cfg.with_pin_cpus(cpus.clone()),
+                    None => cfg.with_pin_threads(true),
+                },
+                _ => panic!("unknown mode {mode}; use stealing, static or pinned"),
+            };
+            let mut batch = BatchArena::new(cfg);
+            let start = Instant::now();
+            for s in 0..args.steps {
+                fill_actions(batch.actions_mut(), s);
+                batch.step();
+            }
+            let tps = total_ticks as f64 / start.elapsed().as_secs_f64();
+            println!(
+                "{:>24}: {:>12.0} ticks/s  ({:.2}x)",
+                format!("{threads} thread(s) {mode}"),
+                tps,
+                tps / base
+            );
+            if let Some(cpus) = batch.pinned_cpus() {
+                let used = &cpus[..threads.min(cpus.len())];
+                println!("{:>24}  pinned to logical CPUs {used:?}", "");
+            }
         }
-        let tps = total_ticks as f64 / start.elapsed().as_secs_f64();
-        println!(
-            "{:>24}: {:>12.0} ticks/s  ({:.2}x)",
-            format!("BatchArena {threads} thread(s)"),
-            tps,
-            tps / base
-        );
     }
 }

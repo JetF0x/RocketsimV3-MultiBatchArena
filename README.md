@@ -150,6 +150,23 @@ Without `auto_reset`, RocketSim leaves a scored ball in the net, so call `reset(
 Arenas share nothing mutable, so this needs no locks. Each arena is seeded from `(seed, index)`, so the results do not
 depend on scheduling.
 
+## Scheduling and core pinning
+
+| Option (Rust / Python) | Default | Effect |
+|---|---|---|
+| `with_scheduling(Scheduling::Static)` / `scheduling="static"` | static | Thread `k` always steps the same contiguous block of arenas, and builds them, so each arena's state stays in one core's caches. Best with at least about 8 arenas per thread. |
+| `Scheduling::WorkStealing` / `scheduling="stealing"` | | Rayon work stealing: balances better on uneven or shared CPUs, but arenas move between cores on every step. |
+| `with_pin_threads(true)` / `pin_threads=True` | off | Pins each thread to one logical CPU per physical core (Linux: from sysfs; Windows: even CPUs when SMT is on). Also sets the default thread count to the core count. |
+| `with_pin_cpus(vec![..])` / `pin_cpus=[..]` | | Pins to an explicit list of logical CPUs. |
+
+Results are bit-identical in every mode. To compare the modes on your machine:
+
+```sh
+cargo run --release -p rocketsim_batch --example bench_batch -- --arenas 1024 --threads 16 --ticks 8 --steps 300 --blue 3 --orange 3 --meshes ./collision_meshes --modes stealing,static,pinned
+```
+
+Add `--pin-cpus 0,2,4,...` to choose the CPUs yourself.
+
 ## Benchmarks
 
 `cargo run --release -p rocketsim_batch --example bench_batch -- --arenas 256 --threads 1,2,4 --ticks 8 --steps 300 [--blue 3 --orange 3] [--meshes ./collision_meshes]`

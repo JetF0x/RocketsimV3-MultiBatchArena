@@ -3,8 +3,9 @@
 //! points at a dumped `collision_meshes` folder.
 
 use rocketsim_batch::{
-    BatchArena, BatchConfig, NO_GOAL, arena_seed,
+    BatchArena, BatchConfig, NO_GOAL, Scheduling, arena_seed,
     layout::{self, ACTION_DIM, BALL_DIM, CAR_DIM, action, car},
+    physical_core_cpus,
     rocketsim::{Arena, BallState, GameMode, Team, Vec3A},
     splitmix64,
 };
@@ -308,4 +309,50 @@ fn arena_and_batch_are_thread_safe() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Arena>();
     assert_send_sync::<BatchArena>();
+}
+
+#[test]
+fn scheduling_modes_give_identical_results() {
+    let base = void_config(13).with_num_threads(Some(3));
+    let stealing = run_batch(base.clone().with_scheduling(Scheduling::WorkStealing), 25);
+    let fixed = run_batch(base.clone().with_scheduling(Scheduling::Static), 25);
+    let pinned = run_batch(
+        base.with_scheduling(Scheduling::Static)
+            .with_pin_threads(true),
+        25,
+    );
+    assert!(pinned.pinned_cpus().is_some());
+    assert!(fixed.pinned_cpus().is_none());
+    for other in [&fixed, &pinned] {
+        assert_eq!(stealing.ball_obs(), other.ball_obs());
+        assert_eq!(stealing.car_obs(), other.car_obs());
+        assert_eq!(stealing.info().episode_ticks, other.info().episode_ticks);
+    }
+}
+
+#[test]
+fn static_with_more_threads_than_arenas() {
+    let config = void_config(3).with_num_threads(Some(8));
+    let mut batch = run_batch(config.clone(), 10);
+    let reference = run_batch(config.with_scheduling(Scheduling::WorkStealing), 10);
+    assert_eq!(batch.car_obs(), reference.car_obs());
+    batch.reset(Some(&[2]), Some(1));
+    assert_eq!(batch.info().episode_ticks, vec![40, 40, 0]);
+}
+
+#[test]
+fn pinning_defaults_to_one_thread_per_pin_target() {
+    let cpus = physical_core_cpus();
+    assert!(!cpus.is_empty());
+    let mut sorted = cpus.clone();
+    sorted.dedup();
+    assert_eq!(sorted, cpus, "sorted and unique");
+
+    let batch = BatchArena::new(void_config(4).with_pin_threads(true));
+    assert_eq!(batch.pinned_cpus(), Some(cpus.as_slice()));
+    assert_eq!(batch.num_threads(), cpus.len());
+
+    let explicit = BatchArena::new(void_config(4).with_pin_cpus(vec![cpus[0]]));
+    assert_eq!(explicit.pinned_cpus(), Some(&[cpus[0]][..]));
+    assert_eq!(explicit.num_threads(), 1);
 }

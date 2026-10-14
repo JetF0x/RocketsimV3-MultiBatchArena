@@ -37,7 +37,12 @@ class BatchArena:
         tick_skip: int = 8,
         auto_reset: bool = False,
         max_episode_ticks: Optional[int] = None,
-    ) -> None: ...
+        scheduling: str = "static",
+        pin_threads: bool = False,
+        pin_cpus: Optional[Sequence[int]] = None,
+    ) -> None:
+        """scheduling: "static" keeps each arena on one thread; "stealing" uses Rayon work
+        stealing. pin_threads pins threads to one logical CPU per physical core (or pin_cpus)."""
     def step(self, actions: Optional[npt.ArrayLike] = None, ticks: Optional[int] = None) -> None:
         """Apply (N, C, 8) actions (None = reuse last) and simulate ``ticks`` (default tick_skip).
 

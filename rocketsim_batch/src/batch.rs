@@ -1,8 +1,11 @@
+use std::{ops::Range, sync::Mutex};
+
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use rocketsim::{Arena, ArenaEvent, CarControls, Team};
 
 use crate::{
-    config::{BatchConfig, arena_seed},
+    affinity::{physical_core_cpus, pin_current_thread},
+    config::{BatchConfig, Scheduling, arena_seed},
     info::{ArenaInfo, StepInfo},
     layout::{ACTION_DIM, BALL_DIM, CAR_DIM, read_action, write_ball, write_car},
 };
@@ -19,10 +22,11 @@ use crate::{
 ///    [`BatchArena::pad_obs`] and [`BatchArena::info`].
 ///
 /// Each arena only touches its own state and its own buffer slices, so the
-/// results are bit-identical for any thread count.
+/// results are bit-identical for any thread count and [`Scheduling`] mode.
 pub struct BatchArena {
     config: BatchConfig,
     pool: ThreadPool,
+    pinned_cpus: Option<Vec<usize>>,
     arenas: Vec<Arena>,
     num_pads: usize,
 
@@ -57,6 +61,11 @@ fn split<T>(buf: &mut [T], n: usize, size: usize) -> std::vec::IntoIter<&mut [T]
     chunks.into_iter()
 }
 
+/// Arenas owned by thread `k` of `threads` under [`Scheduling::Static`].
+fn block_range(k: usize, threads: usize, n: usize) -> Range<usize> {
+    k * n / threads..(k + 1) * n / threads
+}
+
 /// Writes one arena's ball, car and boost pad observations.
 fn write_obs(arena: &Arena, ball: &mut [f32], cars: &mut [f32], pads: &mut [f32]) {
     write_ball(ball, arena.get_ball_state());
@@ -86,41 +95,72 @@ impl BatchArena {
             "BatchConfig needs at least one car per arena"
         );
 
+        let pinned_cpus = config.pin_threads.then(|| {
+            config
+                .pin_cpus
+                .clone()
+                .filter(|cpus| !cpus.is_empty())
+                .unwrap_or_else(physical_core_cpus)
+        });
+
         let mut builder = ThreadPoolBuilder::new().thread_name(|i| format!("rocketsim-batch-{i}"));
-        if let Some(n) = config.num_threads {
+        // When pinning, default to one thread per pin target rather than one
+        // per logical CPU, so two threads never share a core.
+        let num_threads = config
+            .num_threads
+            .or_else(|| pinned_cpus.as_ref().map(Vec::len));
+        if let Some(n) = num_threads {
             builder = builder.num_threads(n);
+        }
+        if let Some(cpus) = pinned_cpus.clone() {
+            builder = builder.start_handler(move |i| pin_current_thread(cpus[i % cpus.len()]));
         }
         let pool = builder
             .build()
             .expect("failed to build rocketsim_batch thread pool");
 
-        let arenas: Vec<Arena> = pool.install(|| {
-            (0..config.num_arenas)
-                .into_par_iter()
-                .map(|i| {
-                    let arena_config = config
-                        .arena
-                        .clone()
-                        .with_rng_seed(arena_seed(config.seed, i));
-                    let mut arena = Arena::new_with_config(arena_config);
-                    for _ in 0..config.blue_cars {
-                        arena.add_car(Team::Blue, config.car_body);
-                    }
-                    for _ in 0..config.orange_cars {
-                        arena.add_car(Team::Orange, config.car_body);
-                    }
-                    arena.reset_to_random_kickoff(None);
-                    arena
-                })
-                .collect()
-        });
+        let make_arena = |i: usize| {
+            let arena_config = config
+                .arena
+                .clone()
+                .with_rng_seed(arena_seed(config.seed, i));
+            let mut arena = Arena::new_with_config(arena_config);
+            for _ in 0..config.blue_cars {
+                arena.add_car(Team::Blue, config.car_body);
+            }
+            for _ in 0..config.orange_cars {
+                arena.add_car(Team::Orange, config.car_body);
+            }
+            arena.reset_to_random_kickoff(None);
+            arena
+        };
 
         let n = config.num_arenas;
+        let arenas: Vec<Arena> = match config.scheduling {
+            Scheduling::WorkStealing => {
+                pool.install(|| (0..n).into_par_iter().map(make_arena).collect())
+            }
+            // Each thread builds the arenas it will own, so their memory is
+            // first touched (and cached) on that thread's core.
+            Scheduling::Static => {
+                let threads = pool.current_num_threads();
+                pool.broadcast(|ctx| {
+                    block_range(ctx.index(), threads, n)
+                        .map(make_arena)
+                        .collect::<Vec<_>>()
+                })
+                .into_iter()
+                .flatten()
+                .collect()
+            }
+        };
+
         let c = config.cars_per_arena();
         let num_pads = arenas[0].num_boost_pads();
 
         let mut batch = Self {
             pool,
+            pinned_cpus,
             arenas,
             num_pads,
             actions: vec![0.0; n * c * ACTION_DIM],
@@ -184,13 +224,37 @@ impl BatchArena {
             .collect();
 
         let arenas = &mut self.arenas;
-        self.pool.install(|| {
-            arenas
-                .par_iter_mut()
-                .zip(slots)
-                .enumerate()
-                .for_each(|(i, (arena, slot))| f(i, arena, slot));
-        });
+        match self.config.scheduling {
+            Scheduling::WorkStealing => self.pool.install(|| {
+                arenas
+                    .par_iter_mut()
+                    .zip(slots)
+                    .enumerate()
+                    .for_each(|(i, (arena, slot))| f(i, arena, slot));
+            }),
+            Scheduling::Static => {
+                // Hand thread `k` the same block of arenas every call. Each
+                // mutex is locked once, by its own thread, so never contended.
+                let threads = self.pool.current_num_threads();
+                let mut items = arenas.iter_mut().zip(slots).enumerate();
+                let blocks: Vec<Mutex<Option<Vec<_>>>> = (0..threads)
+                    .map(|k| {
+                        let len = block_range(k, threads, n).len();
+                        Mutex::new(Some(items.by_ref().take(len).collect()))
+                    })
+                    .collect();
+                self.pool.broadcast(|ctx| {
+                    let block = blocks[ctx.index()]
+                        .lock()
+                        .expect("block mutex poisoned")
+                        .take()
+                        .expect("block already taken");
+                    for (i, (arena, slot)) in block {
+                        f(i, arena, slot);
+                    }
+                });
+            }
+        }
     }
 
     /// Steps every arena by the configured `tick_skip`.
@@ -439,6 +503,13 @@ impl BatchArena {
     #[must_use]
     pub const fn num_pads(&self) -> usize {
         self.num_pads
+    }
+
+    /// Logical CPUs the pool threads are pinned to (thread `i` uses entry
+    /// `i % len`), or `None` when pinning is off.
+    #[must_use]
+    pub fn pinned_cpus(&self) -> Option<&[usize]> {
+        self.pinned_cpus.as_deref()
     }
 
     /// Threads in the batch's pool.

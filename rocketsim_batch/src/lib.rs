@@ -21,13 +21,15 @@
 //! }
 //! ```
 
+mod affinity;
 mod batch;
 mod config;
 mod info;
 pub mod layout;
 
+pub use affinity::physical_core_cpus;
 pub use batch::BatchArena;
-pub use config::{BatchConfig, arena_seed, splitmix64};
+pub use config::{BatchConfig, Scheduling, arena_seed, splitmix64};
 pub use info::{NO_GOAL, StepInfo};
 /// The vendored RocketSim v3 crate, for direct access to its full API.
 pub use rocketsim;

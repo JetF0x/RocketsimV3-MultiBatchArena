@@ -50,15 +50,75 @@ struct Slot<'a> {
     info: ArenaInfo<'a>,
 }
 
-/// Splits `buf` into `n` chunks of `size`, allowing `size == 0`.
-fn split<T>(buf: &mut [T], n: usize, size: usize) -> std::vec::IntoIter<&mut [T]> {
-    debug_assert_eq!(buf.len(), n * size);
-    let chunks: Vec<_> = if size == 0 {
-        (0..n).map(|_| <&mut [T]>::default()).collect()
-    } else {
-        buf.chunks_mut(size).collect()
-    };
-    chunks.into_iter()
+/// Splits the first `n` items off `s` (any `n`, including 0).
+fn take_mut<'a, T>(s: &mut &'a mut [T], n: usize) -> &'a mut [T] {
+    let (head, tail) = std::mem::take(s).split_at_mut(n);
+    *s = tail;
+    head
+}
+
+/// Shared-slice version of [`take_mut`].
+fn take_ref<'a, T>(s: &mut &'a [T], n: usize) -> &'a [T] {
+    let (head, tail) = s.split_at(n);
+    *s = tail;
+    head
+}
+
+/// A contiguous run of arenas with their slices of every batch buffer.
+///
+/// Buffers are split per chunk on the calling thread (a handful of chunks per
+/// pool thread), and each worker then carves per-arena [`Slot`]s out of its
+/// own chunk. That keeps the serial work per step independent of the arena
+/// count.
+struct Chunk<'a> {
+    start: usize,
+    arenas: &'a mut [Arena],
+    actions: &'a [f32],
+    ball: &'a mut [f32],
+    cars: &'a mut [f32],
+    pads: &'a mut [f32],
+    final_ball: &'a mut [f32],
+    final_cars: &'a mut [f32],
+    goal: &'a mut [i8],
+    terminated: &'a mut [u8],
+    truncated: &'a mut [u8],
+    ticks_simulated: &'a mut [u32],
+    episode_ticks: &'a mut [u64],
+    ball_touches: &'a mut [u32],
+    demos: &'a mut [u32],
+    demoed: &'a mut [u32],
+    boost_pickups: &'a mut [u32],
+}
+
+impl Chunk<'_> {
+    /// Runs `f` on each arena of the chunk, in order.
+    fn run<F>(mut self, cars: usize, pads: usize, f: &F)
+    where
+        F: Fn(usize, &mut Arena, Slot<'_>),
+    {
+        for (j, arena) in self.arenas.iter_mut().enumerate() {
+            let slot = Slot {
+                actions: take_ref(&mut self.actions, cars * ACTION_DIM),
+                ball: take_mut(&mut self.ball, BALL_DIM),
+                cars: take_mut(&mut self.cars, cars * CAR_DIM),
+                pads: take_mut(&mut self.pads, pads),
+                final_ball: take_mut(&mut self.final_ball, BALL_DIM),
+                final_cars: take_mut(&mut self.final_cars, cars * CAR_DIM),
+                info: ArenaInfo {
+                    goal: &mut take_mut(&mut self.goal, 1)[0],
+                    terminated: &mut take_mut(&mut self.terminated, 1)[0],
+                    truncated: &mut take_mut(&mut self.truncated, 1)[0],
+                    ticks_simulated: &mut take_mut(&mut self.ticks_simulated, 1)[0],
+                    episode_ticks: &mut take_mut(&mut self.episode_ticks, 1)[0],
+                    ball_touches: take_mut(&mut self.ball_touches, cars),
+                    demos: take_mut(&mut self.demos, cars),
+                    demoed: take_mut(&mut self.demoed, cars),
+                    boost_pickups: take_mut(&mut self.boost_pickups, cars),
+                },
+            };
+            f(self.start + j, arena, slot);
+        }
+    }
 }
 
 /// Arenas owned by thread `k` of `threads` under [`Scheduling::Static`].
@@ -183,75 +243,79 @@ impl BatchArena {
     {
         let n = self.arenas.len();
         let c = self.config.cars_per_arena();
+        let p = self.num_pads;
+        let threads = self.pool.current_num_threads();
+
+        // Static: one block per thread. Work stealing: ~8 chunks per thread,
+        // enough for idle threads to balance load without per-arena work.
+        let ranges: Vec<Range<usize>> = match self.config.scheduling {
+            Scheduling::Static => (0..threads).map(|k| block_range(k, threads, n)).collect(),
+            Scheduling::WorkStealing => {
+                let size = n.div_ceil(threads * 8).max(1);
+                (0..n).step_by(size).map(|s| s..(s + size).min(n)).collect()
+            }
+        };
+
         let info = &mut self.info;
+        let mut arenas = self.arenas.as_mut_slice();
+        let mut actions = self.actions.as_slice();
+        let mut ball = self.ball_obs.as_mut_slice();
+        let mut cars = self.car_obs.as_mut_slice();
+        let mut pads = self.pad_obs.as_mut_slice();
+        let mut final_ball = self.final_ball_obs.as_mut_slice();
+        let mut final_cars = self.final_car_obs.as_mut_slice();
+        let mut goal = info.goal.as_mut_slice();
+        let mut terminated = info.terminated.as_mut_slice();
+        let mut truncated = info.truncated.as_mut_slice();
+        let mut ticks_simulated = info.ticks_simulated.as_mut_slice();
+        let mut episode_ticks = info.episode_ticks.as_mut_slice();
+        let mut ball_touches = info.ball_touches.as_mut_slice();
+        let mut demos = info.demos.as_mut_slice();
+        let mut demoed = info.demoed.as_mut_slice();
+        let mut boost_pickups = info.boost_pickups.as_mut_slice();
 
-        let mut actions = self.actions.chunks(c * ACTION_DIM);
-        let mut ball = split(&mut self.ball_obs, n, BALL_DIM);
-        let mut cars = split(&mut self.car_obs, n, c * CAR_DIM);
-        let mut pads = split(&mut self.pad_obs, n, self.num_pads);
-        let mut final_ball = split(&mut self.final_ball_obs, n, BALL_DIM);
-        let mut final_cars = split(&mut self.final_car_obs, n, c * CAR_DIM);
-        let mut goal = info.goal.iter_mut();
-        let mut terminated = info.terminated.iter_mut();
-        let mut truncated = info.truncated.iter_mut();
-        let mut ticks_simulated = info.ticks_simulated.iter_mut();
-        let mut episode_ticks = info.episode_ticks.iter_mut();
-        let mut ball_touches = split(&mut info.ball_touches, n, c);
-        let mut demos = split(&mut info.demos, n, c);
-        let mut demoed = split(&mut info.demoed, n, c);
-        let mut boost_pickups = split(&mut info.boost_pickups, n, c);
-
-        let slots: Vec<Slot<'_>> = (0..n)
-            .map(|_| Slot {
-                actions: actions.next().unwrap(),
-                ball: ball.next().unwrap(),
-                cars: cars.next().unwrap(),
-                pads: pads.next().unwrap(),
-                final_ball: final_ball.next().unwrap(),
-                final_cars: final_cars.next().unwrap(),
-                info: ArenaInfo {
-                    goal: goal.next().unwrap(),
-                    terminated: terminated.next().unwrap(),
-                    truncated: truncated.next().unwrap(),
-                    ticks_simulated: ticks_simulated.next().unwrap(),
-                    episode_ticks: episode_ticks.next().unwrap(),
-                    ball_touches: ball_touches.next().unwrap(),
-                    demos: demos.next().unwrap(),
-                    demoed: demoed.next().unwrap(),
-                    boost_pickups: boost_pickups.next().unwrap(),
-                },
+        let chunks: Vec<Chunk<'_>> = ranges
+            .into_iter()
+            .map(|r| {
+                let len = r.len();
+                Chunk {
+                    start: r.start,
+                    arenas: take_mut(&mut arenas, len),
+                    actions: take_ref(&mut actions, len * c * ACTION_DIM),
+                    ball: take_mut(&mut ball, len * BALL_DIM),
+                    cars: take_mut(&mut cars, len * c * CAR_DIM),
+                    pads: take_mut(&mut pads, len * p),
+                    final_ball: take_mut(&mut final_ball, len * BALL_DIM),
+                    final_cars: take_mut(&mut final_cars, len * c * CAR_DIM),
+                    goal: take_mut(&mut goal, len),
+                    terminated: take_mut(&mut terminated, len),
+                    truncated: take_mut(&mut truncated, len),
+                    ticks_simulated: take_mut(&mut ticks_simulated, len),
+                    episode_ticks: take_mut(&mut episode_ticks, len),
+                    ball_touches: take_mut(&mut ball_touches, len * c),
+                    demos: take_mut(&mut demos, len * c),
+                    demoed: take_mut(&mut demoed, len * c),
+                    boost_pickups: take_mut(&mut boost_pickups, len * c),
+                }
             })
             .collect();
 
-        let arenas = &mut self.arenas;
         match self.config.scheduling {
             Scheduling::WorkStealing => self.pool.install(|| {
-                arenas
-                    .par_iter_mut()
-                    .zip(slots)
-                    .enumerate()
-                    .for_each(|(i, (arena, slot))| f(i, arena, slot));
+                chunks.into_par_iter().for_each(|chunk| chunk.run(c, p, &f));
             }),
             Scheduling::Static => {
-                // Hand thread `k` the same block of arenas every call. Each
-                // mutex is locked once, by its own thread, so never contended.
-                let threads = self.pool.current_num_threads();
-                let mut items = arenas.iter_mut().zip(slots).enumerate();
-                let blocks: Vec<Mutex<Option<Vec<_>>>> = (0..threads)
-                    .map(|k| {
-                        let len = block_range(k, threads, n).len();
-                        Mutex::new(Some(items.by_ref().take(len).collect()))
-                    })
-                    .collect();
+                // Thread `k` gets block `k` every call. Each mutex is locked
+                // once, by its own thread, so it is never contended.
+                let blocks: Vec<Mutex<Option<Chunk<'_>>>> =
+                    chunks.into_iter().map(|ch| Mutex::new(Some(ch))).collect();
                 self.pool.broadcast(|ctx| {
-                    let block = blocks[ctx.index()]
+                    let chunk = blocks[ctx.index()]
                         .lock()
                         .expect("block mutex poisoned")
                         .take()
                         .expect("block already taken");
-                    for (i, (arena, slot)) in block {
-                        f(i, arena, slot);
-                    }
+                    chunk.run(c, p, &f);
                 });
             }
         }

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "rocketsim_batch"
+version = "0.1.0"
+description = "Step many RocketSim v3 arenas in parallel with numpy buffers"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = ["numpy>=1.21"]
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.maturin]
+python-source = "python"
+module-name = "rocketsim_batch._core"
+features = ["pyo3/extension-module"]

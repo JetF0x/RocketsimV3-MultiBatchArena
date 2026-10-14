@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = [
+  "vendor/rocketsim",
+  "rocketsim_batch",
+  "rocketsim_batch_py",
+]
+default-members = [
+  "vendor/rocketsim",
+  "rocketsim_batch",
+]
+
+# Inherited by the vendored upstream crate (kept identical to upstream v3-rust).
+[workspace.package]
+version = "0.2.11"
+edition = "2024"
+rust-version = "1.95"
+documentation = "https://docs.rs/rocketsim"
+homepage = "https://github.com/ZealanL/RocketSim"
+repository = "https://github.com/ZealanL/RocketSim"
+license = "MIT"
+keywords = ["physics", "rocket-league", "simulation"]
+categories = ["game-development", "simulation"]
+
+[workspace.dependencies]
+glam = { version = "0.33.5", features = ["debug-glam-assert"] }
+rustc-hash = "2.1.2"
+rayon = "1.11"
+
+[profile.dev]
+opt-level = 1
+
+# Matches upstream, except panics unwind so the Python extension can turn
+# them into exceptions instead of aborting the interpreter.
+[profile.release]
+debug = true
+lto = true
+codegen-units = 1

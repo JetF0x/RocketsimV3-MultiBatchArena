@@ -1,0 +1,15 @@
+[package]
+name = "rocketsim_batch"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Step many RocketSim v3 arenas in parallel with flat, RL-friendly buffers"
+license = "MIT"
+publish = false
+
+[dependencies]
+rayon.workspace = true
+rocketsim = { path = "../vendor/rocketsim" }
+
+[lints.clippy]
+all = "warn"

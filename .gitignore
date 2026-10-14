@@ -1,0 +1,9 @@
+/target
+__pycache__/
+*.so
+*.pyd
+*.egg-info/
+.pytest_cache/
+.venv/
+/collision_meshes
+*.cmf

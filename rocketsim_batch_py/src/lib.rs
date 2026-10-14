@@ -134,7 +134,7 @@ impl BatchArena {
         tick_skip = 8,
         auto_reset = false,
         max_episode_ticks = None,
-        scheduling = "static",
+        scheduling = "stealing",
         pin_threads = false,
         pin_cpus = None,
     ))]

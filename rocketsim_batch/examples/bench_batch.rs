@@ -138,10 +138,13 @@ fn main() {
             cfg = match mode.as_str() {
                 "stealing" => cfg.with_scheduling(Scheduling::WorkStealing),
                 "static" => cfg.with_scheduling(Scheduling::Static),
-                "pinned" => match &args.pin_cpus {
-                    Some(cpus) => cfg.with_pin_cpus(cpus.clone()),
-                    None => cfg.with_pin_threads(true),
-                },
+                "pinned" => {
+                    let cfg = cfg.with_scheduling(Scheduling::Static);
+                    match &args.pin_cpus {
+                        Some(cpus) => cfg.with_pin_cpus(cpus.clone()),
+                        None => cfg.with_pin_threads(true),
+                    }
+                }
                 _ => panic!("unknown mode {mode}; use stealing, static or pinned"),
             };
             let mut batch = BatchArena::new(cfg);

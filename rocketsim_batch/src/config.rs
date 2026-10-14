@@ -5,12 +5,13 @@ use rocketsim::{ArenaConfig, ArenaMemWeightMode, CarBodyConfig, GameMode};
 pub enum Scheduling {
     /// Thread `k` of `T` always steps the same contiguous block of arenas
     /// (`k*N/T .. (k+1)*N/T`), so each arena's state stays in one core's
-    /// caches. Best for large batches (at least ~8 arenas per thread).
-    #[default]
+    /// caches. Only worth it together with `pin_threads`: unpinned, the OS
+    /// may put two threads on one core and every other thread waits for them.
     Static,
-    /// Rayon work stealing: idle threads take arenas from busy ones. Arenas
-    /// move between cores from step to step, which costs cache misses, but
-    /// uneven or tiny batches balance better.
+    /// Rayon work stealing (default): idle threads take arenas from busy
+    /// ones, so slow or shared cores are balanced out. Arenas may move
+    /// between cores from step to step.
+    #[default]
     WorkStealing,
 }
 
@@ -72,7 +73,7 @@ impl BatchConfig {
             tick_skip: 8,
             auto_reset: false,
             max_episode_ticks: None,
-            scheduling: Scheduling::Static,
+            scheduling: Scheduling::WorkStealing,
             pin_threads: false,
             pin_cpus: None,
         }

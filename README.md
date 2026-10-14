@@ -154,12 +154,13 @@ depend on scheduling.
 
 | Option (Rust / Python) | Default | Effect |
 |---|---|---|
-| `with_scheduling(Scheduling::Static)` / `scheduling="static"` | static | Thread `k` always steps the same contiguous block of arenas, and builds them, so each arena's state stays in one core's caches. Best with at least about 8 arenas per thread. |
-| `Scheduling::WorkStealing` / `scheduling="stealing"` | | Rayon work stealing: balances better on uneven or shared CPUs, but arenas move between cores on every step. |
+| `Scheduling::WorkStealing` / `scheduling="stealing"` | yes | Rayon work stealing: idle threads take arenas from busy ones, so slow or shared cores are balanced out. |
+| `with_scheduling(Scheduling::Static)` / `scheduling="static"` | | Thread `k` always builds and steps the same block of arenas. Use it only with pinning: unpinned, the OS can put two threads on one core and everyone waits for them. |
 | `with_pin_threads(true)` / `pin_threads=True` | off | Pins each thread to one logical CPU per physical core (Linux: from sysfs; Windows: even CPUs when SMT is on). Also sets the default thread count to the core count. |
 | `with_pin_cpus(vec![..])` / `pin_cpus=[..]` | | Pins to an explicit list of logical CPUs. |
 
-Results are bit-identical in every mode. To compare the modes on your machine:
+Results are bit-identical in every mode. Measured on a Ryzen 9 9950X3D (1024 arenas, 3v3, 16 threads): stealing
+5.91M ticks/s, static unpinned 4.70M, static + pinned 5.93M. Compare on your machine with:
 
 ```sh
 cargo run --release -p rocketsim_batch --example bench_batch -- --arenas 1024 --threads 16 --ticks 8 --steps 300 --blue 3 --orange 3 --meshes ./collision_meshes --modes stealing,static,pinned
